@@ -252,8 +252,14 @@ impl PlaybackQueue {
                 }
             }
             ShuffleMode::Tracks => {
-                self.shuffle_cursor += 1;
-                if self.shuffle_cursor < self.shuffled_indices.len() {
+                let next_cursor = if self.current.is_some() {
+                    self.shuffle_cursor + 1
+                } else {
+                    self.shuffle_cursor
+                };
+
+                if next_cursor < self.shuffled_indices.len() {
+                    self.shuffle_cursor = next_cursor;
                     let playlist_idx = self.shuffled_indices[self.shuffle_cursor];
                     self.playlist_index = Some(playlist_idx);
                     self.current = Some(self.playlist[playlist_idx]);
