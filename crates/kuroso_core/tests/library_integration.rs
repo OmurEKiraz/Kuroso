@@ -364,6 +364,37 @@ fn test_scrobble_criteria() {
 }
 
 #[test]
+fn test_engine_multi_root_lifecycle() {
+    let temp_base = std::env::temp_dir().join("kuroso_test_engine_multi");
+    let dir_a = temp_base.join("music_a");
+    let dir_b = temp_base.join("music_b");
+    let cache = temp_base.join("engine_cache.bin");
+
+    let _ = fs::create_dir_all(&dir_a);
+    let _ = fs::create_dir_all(&dir_b);
+    let _ = fs::remove_file(&cache);
+
+    // 1. Open engine with single root
+    let engine = kuroso_core::library::LibraryEngine::open(&dir_a, &cache)
+        .expect("Engine failed to open");
+
+    assert_eq!(engine.tracked_roots().len(), 1);
+    assert_eq!(engine.tracked_roots()[0], dir_a);
+
+    // 2. Add a second root dynamically
+    engine.add_root(&dir_b).expect("Failed to add root");
+    assert_eq!(engine.tracked_roots().len(), 2);
+    assert!(engine.tracked_roots().contains(&dir_b));
+
+    // 3. Remove a root dynamically
+    engine.remove_root(&dir_a).expect("Failed to remove root");
+    assert_eq!(engine.tracked_roots().len(), 1);
+    assert_eq!(engine.tracked_roots()[0], dir_b);
+
+    let _ = fs::remove_dir_all(temp_base);
+}
+
+#[test]
 fn test_pagination_and_sorting() {
     let (db, _) = create_populated_db();
     let queries = LibraryQueries::new(&db);

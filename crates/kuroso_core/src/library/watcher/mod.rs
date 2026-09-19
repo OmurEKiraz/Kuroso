@@ -21,14 +21,15 @@ pub enum LibraryEvent {
 }
 
 pub struct LibraryWatcher {
-    _debouncer: Debouncer<notify_debouncer_mini::notify::RecommendedWatcher>,
+    debouncer: Debouncer<notify_debouncer_mini::notify::RecommendedWatcher>,
     worker_handle: Option<JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
 }
 
 impl LibraryWatcher {
-    pub fn start<P: AsRef<Path>>(
-        watch_path: P,
+    /// Starts watching multiple root directories simultaneously.
+    pub fn start_multiple<P: AsRef<Path>>(
+        watch_paths: &[P],
         db: Arc<LibraryDatabase>,
         debounce_duration: Duration,
     ) -> Result<(Self, Receiver<LibraryEvent>), Box<dyn std::error::Error>> {
@@ -44,9 +45,12 @@ impl LibraryWatcher {
             }
         })?;
 
-        debouncer
-            .watcher()
-            .watch(watch_path.as_ref(), RecursiveMode::Recursive)?;
+        for path in watch_paths {
+            let p = path.as_ref();
+            if p.exists() && p.is_dir() {
+                debouncer.watcher().watch(p, RecursiveMode::Recursive)?;
+            }
+        }
 
         let stop_clone = Arc::clone(&stop_signal);
         let worker_handle = thread::spawn(move || {
@@ -55,12 +59,36 @@ impl LibraryWatcher {
 
         Ok((
             Self {
-                _debouncer: debouncer,
+                debouncer,
                 worker_handle: Some(worker_handle),
                 stop_signal,
             },
             client_event_rx,
         ))
+    }
+
+    /// Single directory helper maintaining backwards compatibility.
+    pub fn start<P: AsRef<Path>>(
+        watch_path: P,
+        db: Arc<LibraryDatabase>,
+        debounce_duration: Duration,
+    ) -> Result<(Self, Receiver<LibraryEvent>), Box<dyn std::error::Error>> {
+        Self::start_multiple(&[watch_path.as_ref()], db, debounce_duration)
+    }
+
+    /// Dynamically registers a newly mounted or added directory to live watching.
+    pub fn watch_directory<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn std::error::Error>> {
+        let p = path.as_ref();
+        if p.exists() && p.is_dir() {
+            self.debouncer.watcher().watch(p, RecursiveMode::Recursive)?;
+        }
+        Ok(())
+    }
+
+    /// Unregisters an unmounted directory from live watching.
+    pub fn unwatch_directory<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = self.debouncer.watcher().unwatch(path.as_ref());
+        Ok(())
     }
 
     fn worker_loop(
@@ -94,7 +122,7 @@ impl LibraryWatcher {
                 continue;
             }
 
-            // Case 2: File exists
+            // Case 2: File exists / modified
             let metadata = match fs::metadata(&path) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -223,6 +251,7 @@ impl Drop for LibraryWatcher {
 mod tests {
     use super::*;
     use std::fs::File;
+    use std::io::Write;
 
     #[test]
     fn test_watcher_ignores_unsupported_extensions() {
@@ -239,7 +268,6 @@ mod tests {
 
         let txt_path = temp_dir.join("notes.txt");
         let mut f = File::create(&txt_path).unwrap();
-        use std::io::Write;
         writeln!(f, "This should be ignored").unwrap();
 
         let received = rx.recv_timeout(Duration::from_millis(200));
@@ -247,5 +275,30 @@ mod tests {
 
         let _ = fs::remove_file(txt_path);
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_watcher_multiple_directories() {
+        let base = std::env::temp_dir().join("kuroso_test_multi_watch");
+        let dir_a = base.join("dir_a");
+        let dir_b = base.join("dir_b");
+        let _ = fs::create_dir_all(&dir_a);
+        let _ = fs::create_dir_all(&dir_b);
+
+        let db = Arc::new(LibraryDatabase::new());
+        let (watcher, _rx) = LibraryWatcher::start_multiple(
+            &[&dir_a, &dir_b],
+            Arc::clone(&db),
+            Duration::from_millis(50),
+        )
+        .expect("Multi watcher must start");
+
+        // Dynamically add a third folder
+        let dir_c = base.join("dir_c");
+        let _ = fs::create_dir_all(&dir_c);
+        let mut w = watcher;
+        assert!(w.watch_directory(&dir_c).is_ok());
+
+        let _ = fs::remove_dir_all(base);
     }
 }

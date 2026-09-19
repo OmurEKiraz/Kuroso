@@ -275,33 +275,51 @@ pub struct ScanReport {
 }
 
 pub fn scan_directory<P: AsRef<Path>>(root: P, db: &LibraryDatabase) -> ScanReport {
-    let mut live_paths = HashSet::new();
+    scan_directories(&[root.as_ref()], db)
+}
 
-    let audio_files: Vec<(PathBuf, u64, u64)> = WalkDir::new(&root)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            if !entry.file_type().is_file() {
-                return false;
-            }
-            entry
-                .path()
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
-                .unwrap_or(false)
-        })
-        .filter_map(|entry| {
-            let path = entry.path();
-            let meta = fs::metadata(&path).ok()?;
-            let file_size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()?
-                .duration_since(UNIX_EPOCH)
-                .ok()?
-                .as_secs();
-            Some((path, mtime, file_size))
+pub fn scan_directories<P: AsRef<Path>>(roots: &[P], db: &LibraryDatabase) -> ScanReport {
+    let mut live_paths = HashSet::new();
+    let mut newly_added = 0;
+    let mut updated = 0;
+
+    let valid_roots: Vec<&Path> = roots
+        .iter()
+        .map(|r| r.as_ref())
+        .filter(|r| r.exists() && r.is_dir())
+        .collect();
+
+    // 1. Gather audio files across all valid roots
+    let audio_files: Vec<(PathBuf, u64, u64)> = valid_roots
+        .iter()
+        .flat_map(|root| {
+            WalkDir::new(root)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    if !entry.file_type().is_file() {
+                        return false;
+                    }
+                    entry
+                        .path()
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+                        .unwrap_or(false)
+                })
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    let meta = fs::metadata(&path).ok()?;
+                    let file_size = meta.len();
+                    let mtime = meta
+                        .modified()
+                        .ok()?
+                        .duration_since(UNIX_EPOCH)
+                        .ok()?
+                        .as_secs();
+                    Some((path, mtime, file_size))
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -309,20 +327,20 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, db: &LibraryDatabase) -> ScanRepo
         live_paths.insert(p.clone());
     }
 
+    // 2. Filter files that need re-reading
     let to_process: Vec<PathBuf> = audio_files
         .into_iter()
         .filter(|(path, mtime, size)| db.should_rescan(path, *mtime, *size))
         .map(|(path, _, _)| path)
         .collect();
 
+    // 3. Parallel tag extraction
     let extracted: Vec<ExtractedMetadata> = to_process
         .par_iter()
         .filter_map(|path| read_metadata(path))
         .collect();
 
-    let mut newly_added = 0;
-    let mut updated = 0;
-
+    // 4. Update database
     for meta in extracted {
         if db.get_track_by_path(&meta.path).is_some() {
             db.update_track_metadata(
@@ -374,7 +392,8 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, db: &LibraryDatabase) -> ScanRepo
         }
     }
 
-    let pruned = db.prune_missing_files_scoped(&[root.as_ref()], &live_paths);
+    // 5. Scoped pruning across all roots (unmounted/offline roots are protected)
+    let pruned = db.prune_missing_files_scoped(roots, &live_paths);
 
     ScanReport {
         scanned_files: live_paths.len(),
