@@ -22,7 +22,7 @@ pub enum AudioFormat {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     pub id: TrackId,
     pub path: PathBuf,
@@ -30,6 +30,7 @@ pub struct Track {
     pub file_size: u64,
     pub title: SmolStr,
     pub artist_id: ArtistId,
+    pub album_artist_id: Option<ArtistId>,
     pub album_id: Option<AlbumId>,
     pub duration_ms: u32,
     pub track_number: Option<u16>,
@@ -38,6 +39,12 @@ pub struct Track {
     pub format: AudioFormat,
     pub sample_rate: Option<u32>,
     pub bitrate: Option<u32>,
+    pub bit_depth: Option<u8>,
+    pub channels: Option<u8>,
+    pub track_gain_db: Option<f32>,
+    pub track_peak: Option<f32>,
+    pub album_gain_db: Option<f32>,
+    pub album_peak: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +53,7 @@ pub struct Album {
     pub title: SmolStr,
     pub artist_id: ArtistId,
     pub year: Option<u16>,
+    pub is_compilation: bool,
     pub tracks: Vec<TrackId>,
 }
 
@@ -78,19 +86,26 @@ mod tests {
     fn test_track_serialization_roundtrip() {
         let track = Track {
             id: TrackId(42),
-            path: PathBuf::from("/music/sample.opus"),
+            path: PathBuf::from("/music/sample.flac"),
             mtime: 1710000000,
-            file_size: 1048576,
+            file_size: 25_000_000,
             title: SmolStr::new("Kinetic Drift"),
             artist_id: ArtistId(1),
+            album_artist_id: Some(ArtistId(2)),
             album_id: Some(AlbumId(10)),
             duration_ms: 184500,
             track_number: Some(1),
             disc_number: Some(1),
             year: Some(2024),
-            format: AudioFormat::Opus,
-            sample_rate: Some(48000),
-            bitrate: Some(128000),
+            format: AudioFormat::Flac,
+            sample_rate: Some(96000),
+            bitrate: Some(1500000),
+            bit_depth: Some(24),
+            channels: Some(2),
+            track_gain_db: Some(-6.5),
+            track_peak: Some(0.98),
+            album_gain_db: Some(-5.8),
+            album_peak: Some(1.0),
         };
 
         let json = serde_json::to_string(&track).expect("Serialization failed");
@@ -117,10 +132,12 @@ mod tests {
             title: SmolStr::new("Zero Overhead"),
             artist_id,
             year: Some(2025),
+            is_compilation: false,
             tracks: vec![track_id],
         };
 
         assert_eq!(artist.albums[0], album.id);
         assert_eq!(album.tracks[0], track_id);
+        assert!(!album.is_compilation);
     }
 }

@@ -1,8 +1,8 @@
 use crate::library::types::*;
+use bincode::Options;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use bincode::Options;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -124,6 +124,7 @@ impl LibraryDatabase {
         fs::rename(&tmp_path, target_path)?;
         Ok(())
     }
+
     /// Loads the binary database from disk with comprehensive validation checks.
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseLoadError> {
         let path = path.as_ref();
@@ -167,7 +168,7 @@ impl LibraryDatabase {
 
         let state: DatabaseState = bincode::DefaultOptions::new()
             .with_fixint_encoding()
-            .with_limit(file_len) // Prevent malicious or corrupted huge memory allocations
+            .with_limit(file_len)
             .deserialize_from(reader)
             .map_err(DatabaseLoadError::CorruptedData)?;
 
@@ -272,6 +273,7 @@ impl LibraryDatabase {
         artist_id: ArtistId,
         title: &str,
         year: Option<u16>,
+        is_compilation: bool,
     ) -> AlbumId {
         let title_str = SmolStr::new(title);
         let key = (artist_id, title_str.clone());
@@ -286,6 +288,7 @@ impl LibraryDatabase {
             title: title_str,
             artist_id,
             year,
+            is_compilation,
             tracks: Vec::new(),
         };
 
@@ -299,6 +302,7 @@ impl LibraryDatabase {
         id
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_track(
         &self,
         path: PathBuf,
@@ -306,6 +310,7 @@ impl LibraryDatabase {
         file_size: u64,
         title: &str,
         artist_name: &str,
+        album_artist_name: Option<&str>,
         album_name: Option<&str>,
         duration_ms: u32,
         track_number: Option<u16>,
@@ -314,6 +319,12 @@ impl LibraryDatabase {
         format: AudioFormat,
         sample_rate: Option<u32>,
         bitrate: Option<u32>,
+        bit_depth: Option<u8>,
+        channels: Option<u8>,
+        track_gain_db: Option<f32>,
+        track_peak: Option<f32>,
+        album_gain_db: Option<f32>,
+        album_peak: Option<f32>,
     ) -> TrackId {
         let mut state = self.state.write();
 
@@ -322,8 +333,17 @@ impl LibraryDatabase {
         }
 
         let artist_id = self.resolve_or_create_artist(&mut state, artist_name);
-        let album_id =
-            album_name.map(|name| self.resolve_or_create_album(&mut state, artist_id, name, year));
+        let album_artist_id = album_artist_name.map(|name| self.resolve_or_create_artist(&mut state, name));
+
+        // Use album artist if present, otherwise default to track artist for the album's primary anchor
+        let album_owner_id = album_artist_id.unwrap_or(artist_id);
+        let is_compilation = album_artist_name
+            .map(|a| a.eq_ignore_ascii_case("various artists"))
+            .unwrap_or(false);
+
+        let album_id = album_name.map(|name| {
+            self.resolve_or_create_album(&mut state, album_owner_id, name, year, is_compilation)
+        });
         let track_id = self.next_track_id();
 
         let track = Track {
@@ -333,6 +353,7 @@ impl LibraryDatabase {
             file_size,
             title: SmolStr::new(title),
             artist_id,
+            album_artist_id,
             album_id,
             duration_ms,
             track_number,
@@ -341,6 +362,12 @@ impl LibraryDatabase {
             format,
             sample_rate,
             bitrate,
+            bit_depth,
+            channels,
+            track_gain_db,
+            track_peak,
+            album_gain_db,
+            album_peak,
         };
 
         state.path_to_track.insert(path, track_id);
@@ -357,6 +384,7 @@ impl LibraryDatabase {
         track_id
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_track_metadata(
         &self,
         path: &Path,
@@ -364,6 +392,7 @@ impl LibraryDatabase {
         file_size: u64,
         title: &str,
         artist_name: &str,
+        album_artist_name: Option<&str>,
         album_name: Option<&str>,
         duration_ms: u32,
         track_number: Option<u16>,
@@ -371,14 +400,35 @@ impl LibraryDatabase {
         year: Option<u16>,
         sample_rate: Option<u32>,
         bitrate: Option<u32>,
+        bit_depth: Option<u8>,
+        channels: Option<u8>,
+        track_gain_db: Option<f32>,
+        track_peak: Option<f32>,
+        album_gain_db: Option<f32>,
+        album_peak: Option<f32>,
     ) -> Option<TrackId> {
         let mut state = self.state.write();
         let track_id = *state.path_to_track.get(path)?;
 
         let old_track = state.tracks.get(&track_id)?.clone();
         let new_artist_id = self.resolve_or_create_artist(&mut state, artist_name);
-        let new_album_id = album_name
-            .map(|name| self.resolve_or_create_album(&mut state, new_artist_id, name, year));
+        let new_album_artist_id =
+            album_artist_name.map(|name| self.resolve_or_create_artist(&mut state, name));
+
+        let new_album_owner_id = new_album_artist_id.unwrap_or(new_artist_id);
+        let is_compilation = album_artist_name
+            .map(|a| a.eq_ignore_ascii_case("various artists"))
+            .unwrap_or(false);
+
+        let new_album_id = album_name.map(|name| {
+            self.resolve_or_create_album(
+                &mut state,
+                new_album_owner_id,
+                name,
+                year,
+                is_compilation,
+            )
+        });
 
         if old_track.album_id != new_album_id {
             if let Some(old_aid) = old_track.album_id {
@@ -439,6 +489,7 @@ impl LibraryDatabase {
             track.file_size = file_size;
             track.title = SmolStr::new(title);
             track.artist_id = new_artist_id;
+            track.album_artist_id = new_album_artist_id;
             track.album_id = new_album_id;
             track.duration_ms = duration_ms;
             track.track_number = track_number;
@@ -446,6 +497,12 @@ impl LibraryDatabase {
             track.year = year;
             track.sample_rate = sample_rate;
             track.bitrate = bitrate;
+            track.bit_depth = bit_depth;
+            track.channels = channels;
+            track.track_gain_db = track_gain_db;
+            track.track_peak = track_peak;
+            track.album_gain_db = album_gain_db;
+            track.album_peak = album_peak;
         }
 
         Some(track_id)
@@ -553,6 +610,7 @@ mod tests {
             1024,
             "Binary Persistence",
             "Speed Arch",
+            None,
             Some("Zero Alloc"),
             180000,
             Some(1),
@@ -561,6 +619,12 @@ mod tests {
             AudioFormat::Opus,
             Some(48000),
             Some(128000),
+            Some(16),
+            Some(2),
+            Some(-5.0),
+            Some(0.95),
+            Some(-4.5),
+            Some(0.98),
         );
 
         let temp_dir = std::env::temp_dir();
@@ -576,6 +640,9 @@ mod tests {
 
         let t = loaded_db.get_track(id).expect("Track missing");
         assert_eq!(t.title.as_str(), "Binary Persistence");
+        assert_eq!(t.bit_depth, Some(16));
+        assert_eq!(t.channels, Some(2));
+        assert_eq!(t.track_gain_db, Some(-5.0));
 
         let _ = fs::remove_file(cache_path);
     }
@@ -625,7 +692,6 @@ mod tests {
         let (recovered_db, is_hit) = LibraryDatabase::load_or_recover(&cache_path);
         assert!(!is_hit);
         assert_eq!(recovered_db.track_count(), 0);
-        // Original corrupted file is quarantined / moved
         assert!(!cache_path.exists());
     }
 
@@ -639,11 +705,18 @@ mod tests {
             "Song",
             "Artist",
             None,
+            None,
             1000,
             None,
             None,
             None,
             AudioFormat::Opus,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
         );

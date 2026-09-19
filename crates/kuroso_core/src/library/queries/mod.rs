@@ -33,13 +33,15 @@ pub enum TrackSortBy {
 
 /// UI projection of a track with resolved relational metadata.
 /// Eliminates runtime HashMap lookups during UI table rendering.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrackView {
     pub id: TrackId,
     pub path: std::path::PathBuf,
     pub title: SmolStr,
     pub artist_id: ArtistId,
     pub artist_name: SmolStr,
+    pub album_artist_id: Option<ArtistId>,
+    pub album_artist_name: Option<SmolStr>,
     pub album_id: Option<AlbumId>,
     pub album_title: Option<SmolStr>,
     pub duration_ms: u32,
@@ -49,6 +51,12 @@ pub struct TrackView {
     pub format: AudioFormat,
     pub bitrate: Option<u32>,
     pub sample_rate: Option<u32>,
+    pub bit_depth: Option<u8>,
+    pub channels: Option<u8>,
+    pub track_gain_db: Option<f32>,
+    pub track_peak: Option<f32>,
+    pub album_gain_db: Option<f32>,
+    pub album_peak: Option<f32>,
 }
 
 impl TrackView {
@@ -112,6 +120,7 @@ impl<'a> LibraryQueries<'a> {
     pub fn track_to_view(&self, track: &Track) -> Option<TrackView> {
         let artist = self.db.get_artist(track.artist_id)?;
         let album = track.album_id.and_then(|id| self.db.get_album(id));
+        let album_artist = track.album_artist_id.and_then(|id| self.db.get_artist(id));
 
         Some(TrackView {
             id: track.id,
@@ -119,6 +128,8 @@ impl<'a> LibraryQueries<'a> {
             title: track.title.clone(),
             artist_id: track.artist_id,
             artist_name: artist.name,
+            album_artist_id: track.album_artist_id,
+            album_artist_name: album_artist.map(|a| a.name),
             album_id: track.album_id,
             album_title: album.map(|a| a.title),
             duration_ms: track.duration_ms,
@@ -128,6 +139,12 @@ impl<'a> LibraryQueries<'a> {
             format: track.format,
             bitrate: track.bitrate,
             sample_rate: track.sample_rate,
+            bit_depth: track.bit_depth,
+            channels: track.channels,
+            track_gain_db: track.track_gain_db,
+            track_peak: track.track_peak,
+            album_gain_db: track.album_gain_db,
+            album_peak: track.album_peak,
         })
     }
 
@@ -268,7 +285,7 @@ impl<'a> LibraryQueries<'a> {
             return Vec::new();
         }
 
-        // Edge case: Direct ID query syntax e.g. "id:42" or "track:42"
+        // Direct ID query syntax e.g. "id:42" or "track:42"
         if let Some(id_str) = clean
             .strip_prefix("id:")
             .or_else(|| clean.strip_prefix("track:"))
@@ -312,6 +329,11 @@ impl<'a> LibraryQueries<'a> {
         });
 
         matches
+    }
+
+    /// Alias for `search` to support tests and integrations expecting `search_tracks`
+    pub fn search_tracks(&self, query: &str) -> Vec<TrackView> {
+        self.search(query)
     }
 
     /// Full multi-entity search across tracks, albums, and artists
@@ -372,6 +394,7 @@ mod tests {
             1000,
             "Thunderstruck",
             "AC/DC",
+            None,
             Some("The Razors Edge"),
             292000,
             Some(1),
@@ -380,6 +403,12 @@ mod tests {
             AudioFormat::Opus,
             Some(48000),
             Some(160000),
+            Some(16),
+            Some(2),
+            Some(-6.0),
+            Some(0.95),
+            Some(-5.5),
+            Some(0.98),
         );
 
         db.insert_track(
@@ -388,6 +417,7 @@ mod tests {
             1001,
             "Fire Your Guns",
             "AC/DC",
+            None,
             Some("The Razors Edge"),
             173000,
             Some(2),
@@ -396,6 +426,12 @@ mod tests {
             AudioFormat::Opus,
             Some(48000),
             Some(160000),
+            Some(16),
+            Some(2),
+            Some(-6.2),
+            Some(0.94),
+            Some(-5.5),
+            Some(0.98),
         );
 
         db.insert_track(
@@ -405,6 +441,7 @@ mod tests {
             "Intro",
             "AC/DC",
             None,
+            None,
             15000, // 15 seconds - below scrobble limit
             None,
             None,
@@ -412,6 +449,12 @@ mod tests {
             AudioFormat::Opus,
             Some(48000),
             Some(128000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
 
         db
@@ -469,13 +512,11 @@ mod tests {
         let db = build_test_db();
         let queries = LibraryQueries::new(&db);
 
-        // 292s track passes scrobble requirement
         let payload = queries.get_scrobble_payload(TrackId(1)).unwrap();
         assert_eq!(payload.track_title, "Thunderstruck");
         assert_eq!(payload.artist_name, "AC/DC");
         assert_eq!(payload.duration_seconds, 292);
 
-        // 15s track must return None (rejected for scrobbling)
         let short_payload = queries.get_scrobble_payload(TrackId(3));
         assert!(short_payload.is_none());
     }

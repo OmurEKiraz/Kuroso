@@ -18,6 +18,7 @@ pub struct ExtractedMetadata {
     pub file_size: u64,
     pub title: String,
     pub artist: String,
+    pub album_artist: Option<String>,
     pub album: Option<String>,
     pub duration_ms: u32,
     pub track_number: Option<u16>,
@@ -26,6 +27,50 @@ pub struct ExtractedMetadata {
     pub format: AudioFormat,
     pub sample_rate: Option<u32>,
     pub bitrate: Option<u32>,
+    pub bit_depth: Option<u8>,
+    pub channels: Option<u8>,
+    pub track_gain_db: Option<f32>,
+    pub track_peak: Option<f32>,
+    pub album_gain_db: Option<f32>,
+    pub album_peak: Option<f32>,
+}
+
+pub fn parse_replaygain(val: &str) -> Option<f32> {
+    let clean = val.trim().trim_end_matches("dB").trim_end_matches("db").trim();
+    clean.parse::<f32>().ok()
+}
+
+pub fn extract_replaygain(tag: &Tag) -> (Option<f32>, Option<f32>, Option<f32>, Option<f32>) {
+    let mut track_gain = None;
+    let mut track_peak = None;
+    let mut album_gain = None;
+    let mut album_peak = None;
+
+    for item in tag.items() {
+        if let Some(text) = item.value().text() {
+            match item.key() {
+                ItemKey::ReplayGainTrackGain => track_gain = parse_replaygain(text),
+                ItemKey::ReplayGainTrackPeak => track_peak = parse_replaygain(text),
+                ItemKey::ReplayGainAlbumGain => album_gain = parse_replaygain(text),
+                ItemKey::ReplayGainAlbumPeak => album_peak = parse_replaygain(text),
+                ItemKey::Unknown(k) => {
+                    let lower = k.to_ascii_lowercase();
+                    if lower == "replaygain_track_gain" {
+                        track_gain = parse_replaygain(text);
+                    } else if lower == "replaygain_track_peak" {
+                        track_peak = parse_replaygain(text);
+                    } else if lower == "replaygain_album_gain" {
+                        album_gain = parse_replaygain(text);
+                    } else if lower == "replaygain_album_peak" {
+                        album_peak = parse_replaygain(text);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    (track_gain, track_peak, album_gain, album_peak)
 }
 
 pub fn parse_number_field(val: &str) -> Option<u16> {
@@ -164,6 +209,16 @@ pub fn read_metadata(path: &Path) -> Option<ExtractedMetadata> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Unknown Artist".to_string());
 
+    let album_artist = tag
+        .and_then(|t| {
+            t.get(&ItemKey::AlbumArtist)
+                .or_else(|| t.get(&ItemKey::Unknown("ALBUMARTIST".into())))
+                .or_else(|| t.get(&ItemKey::Unknown("album_artist".into())))
+        })
+        .and_then(|item| item.value().text())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let album = tag
         .and_then(|t| t.album())
         .map(|s| s.trim().to_string())
@@ -183,12 +238,18 @@ pub fn read_metadata(path: &Path) -> Option<ExtractedMetadata> {
     let year = tag.and_then(|t| t.year()).map(|y| y as u16);
     let format = detect_audio_format(path);
 
+    let (track_gain_db, track_peak, album_gain_db, album_peak) = match tag {
+        Some(t) => extract_replaygain(t),
+        None => (None, None, None, None),
+    };
+
     Some(ExtractedMetadata {
         path: path.to_path_buf(),
         mtime,
         file_size,
         title,
         artist,
+        album_artist,
         album,
         duration_ms,
         track_number,
@@ -197,24 +258,13 @@ pub fn read_metadata(path: &Path) -> Option<ExtractedMetadata> {
         format,
         sample_rate: properties.sample_rate(),
         bitrate: properties.audio_bitrate(),
+        bit_depth: properties.bit_depth(),
+        channels: properties.channels(),
+        track_gain_db,
+        track_peak,
+        album_gain_db,
+        album_peak,
     })
-}
-
-pub fn inspect_file_tags(path: &Path) {
-    println!("Inspecting file: {:?}", path);
-    if let Ok(tagged_file) = Probe::open(path).and_then(|p| p.read()) {
-        if let Some(tag) = tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
-            println!("Tag Type: {:?}", tag.tag_type());
-            println!("Items count: {}", tag.item_count());
-            for item in tag.items() {
-                println!("  Key: {:?} | Value: {:?}", item.key(), item.value());
-            }
-        } else {
-            println!("No tags found in file!");
-        }
-    } else {
-        println!("Failed to probe file on disk");
-    }
 }
 
 pub struct ScanReport {
@@ -281,6 +331,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, db: &LibraryDatabase) -> ScanRepo
                 meta.file_size,
                 &meta.title,
                 &meta.artist,
+                meta.album_artist.as_deref(),
                 meta.album.as_deref(),
                 meta.duration_ms,
                 meta.track_number,
@@ -288,6 +339,12 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, db: &LibraryDatabase) -> ScanRepo
                 meta.year,
                 meta.sample_rate,
                 meta.bitrate,
+                meta.bit_depth,
+                meta.channels,
+                meta.track_gain_db,
+                meta.track_peak,
+                meta.album_gain_db,
+                meta.album_peak,
             );
             updated += 1;
         } else {
@@ -297,6 +354,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, db: &LibraryDatabase) -> ScanRepo
                 meta.file_size,
                 &meta.title,
                 &meta.artist,
+                meta.album_artist.as_deref(),
                 meta.album.as_deref(),
                 meta.duration_ms,
                 meta.track_number,
@@ -305,6 +363,12 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, db: &LibraryDatabase) -> ScanRepo
                 meta.format,
                 meta.sample_rate,
                 meta.bitrate,
+                meta.bit_depth,
+                meta.channels,
+                meta.track_gain_db,
+                meta.track_peak,
+                meta.album_gain_db,
+                meta.album_peak,
             );
             newly_added += 1;
         }
