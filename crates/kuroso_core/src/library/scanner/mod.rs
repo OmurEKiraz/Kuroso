@@ -277,7 +277,7 @@ pub struct ScanReport {
 pub fn scan_directory<P: AsRef<Path>>(root: P, db: &LibraryDatabase) -> ScanReport {
     let mut live_paths = HashSet::new();
 
-    let audio_files: Vec<(PathBuf, u64, u64)> = WalkDir::new(root)
+    let audio_files: Vec<(PathBuf, u64, u64)> = WalkDir::new(&root)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| {
@@ -374,7 +374,7 @@ pub fn scan_directory<P: AsRef<Path>>(root: P, db: &LibraryDatabase) -> ScanRepo
         }
     }
 
-    let pruned = db.prune_missing_files(&live_paths);
+    let pruned = db.prune_missing_files_scoped(&[root.as_ref()], &live_paths);
 
     ScanReport {
         scanned_files: live_paths.len(),

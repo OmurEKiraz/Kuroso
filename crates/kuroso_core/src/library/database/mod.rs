@@ -218,6 +218,43 @@ impl LibraryDatabase {
         true
     }
 
+    /// Prunes files missing from `live_paths`, but ONLY if the file resides
+    /// under an accessible/active root. If a removable drive root is currently
+    /// missing or unmounted, its tracks are preserved.
+    pub fn prune_missing_files_scoped<P: AsRef<Path>>(
+        &self,
+        active_roots: &[P],
+        live_paths: &HashSet<PathBuf>,
+    ) -> usize {
+        let valid_roots: Vec<&Path> = active_roots
+            .iter()
+            .map(|r| r.as_ref())
+            .filter(|r| r.exists() && r.is_dir())
+            .collect();
+
+        let dead_paths: Vec<PathBuf> = {
+            let state = self.state.read();
+            state
+                .path_to_track
+                .keys()
+                .filter(|p| {
+                    // Check if file belongs to any currently active root
+                    let under_active_root = valid_roots.iter().any(|root| p.starts_with(root));
+                    // Only prune if it was supposed to be scanned and is missing
+                    under_active_root && !live_paths.contains(*p)
+                })
+                .cloned()
+                .collect()
+        };
+
+        let count = dead_paths.len();
+        for path in dead_paths {
+            self.remove_track_by_path(&path);
+        }
+        count
+    }
+
+    /// Backwards-compatible wrapper: prunes across a single root directory.
     pub fn prune_missing_files(&self, live_paths: &HashSet<PathBuf>) -> usize {
         let dead_paths: Vec<PathBuf> = {
             let state = self.state.read();
@@ -693,6 +730,48 @@ mod tests {
         assert!(!is_hit);
         assert_eq!(recovered_db.track_count(), 0);
         assert!(!cache_path.exists());
+    }
+
+    #[test]
+    fn test_scoped_pruning_protects_unmounted_removable_drives() {
+        let db = LibraryDatabase::new();
+
+        let internal_path = PathBuf::from("/music/internal/track1.opus");
+        let usb_path = PathBuf::from("/mnt/usb_drive/track2.opus");
+
+        db.insert_track(
+            internal_path.clone(),
+            100, 1000, "Internal Track", "Artist", None, None,
+            180_000, None, None, None, AudioFormat::Opus,
+            None, None, None, None, None, None, None, None,
+        );
+
+        db.insert_track(
+            usb_path.clone(),
+            100, 1000, "USB Track", "Artist", None, None,
+            180_000, None, None, None, AudioFormat::Opus,
+            None, None, None, None, None, None, None, None,
+        );
+
+        assert_eq!(db.track_count(), 2);
+
+        // Simulate rescan where /mnt/usb_drive is unmounted (does not exist on disk)
+        // Only a local temp folder exists as an active root
+        let temp_internal_root = std::env::temp_dir();
+        let unmounted_usb_root = PathBuf::from("/mnt/definitely_not_mounted_usb_drive_kuroso");
+
+        let live_paths = HashSet::new();
+        // live_paths has NO files at all (e.g. internal deleted, usb unmounted)
+
+        let pruned = db.prune_missing_files_scoped(
+            &[&temp_internal_root, &unmounted_usb_root],
+            &live_paths,
+        );
+
+        // USB track is untouched because unmounted_usb_root does not exist on disk
+        assert_eq!(pruned, 0);
+        assert_eq!(db.track_count(), 2);
+        assert!(db.get_track_by_path(&usb_path).is_some());
     }
 
     #[test]
