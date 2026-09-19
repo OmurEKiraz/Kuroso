@@ -1,0 +1,12 @@
+[package]
+name = "kuroso"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "kuroso"
+path = "src/main.rs"
+
+[dependencies]
+kuroso_core = { path = "../crates/kuroso_core" }
+kuroso_ui = { path = "../crates/kuroso_ui" }

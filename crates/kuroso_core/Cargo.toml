@@ -1,0 +1,15 @@
+[package]
+name = "kuroso_core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+smol_str.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+lofty.workspace = true
+jwalk.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

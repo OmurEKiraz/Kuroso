@@ -1,0 +1,7 @@
+[package]
+name = "kuroso_ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kuroso_core = { path = "../kuroso_core" }
