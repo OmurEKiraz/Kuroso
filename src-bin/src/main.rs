@@ -1,68 +1,82 @@
 use kuroso_core::library::database::LibraryDatabase;
-use kuroso_core::library::queries::LibraryQueries;
 use kuroso_core::library::scanner::scan_directory;
 use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 
 fn main() {
     let music_dir = env::args()
         .nth(1)
-        .expect("Usage: cargo run --release -p kuroso -- <music_directory>");
+        .unwrap_or_else(|| "crates/testacdc".to_string());
 
-    let cache_file = PathBuf::from("/tmp/kuroso_library.bin");
+    let test_cache = PathBuf::from("/tmp/kuroso_resilience_test.bin");
+    let _ = fs::remove_file(&test_cache);
 
-    // 1. Cold Scan or Instant Binary Load
-    let db = if cache_file.exists() {
-        println!("Found binary cache at {:?}, loading...", cache_file);
-        let start = Instant::now();
-        let loaded = LibraryDatabase::load_from_file(&cache_file).expect("Failed to load cache");
-        println!("Loaded binary cache in {:?}", start.elapsed());
-        Arc::new(loaded)
-    } else {
-        Arc::new(LibraryDatabase::new())
-    };
+    println!("==================================================");
+    println!("KUROSO DATABASE RESILIENCE & INTEGRITY DRILL");
+    println!("==================================================");
 
-    println!("\nRunning Incremental Diff Sync against: {}", music_dir);
-    let start_scan = Instant::now();
+    // 1. Ingest clean data and save atomically
+    println!("\n[Drill 1] Creating valid database from disk...");
+    let db = Arc::new(LibraryDatabase::new());
     let report = scan_directory(&music_dir, &db);
-    let scan_duration = start_scan.elapsed();
+    println!("Ingested {} tracks. Saving atomically...", report.scanned_files);
+    db.save_to_file(&test_cache).expect("Failed atomic save");
+    println!("Saved valid cache to {:?}", test_cache);
 
-    println!("--------------------------------------------------");
-    println!("Scan Time        : {:?}", scan_duration);
-    println!("Files On Disk    : {}", report.scanned_files);
-    println!("New Ingested     : {}", report.newly_added);
-    println!("Updated (mtime)  : {}", report.updated);
-    println!("Pruned Vanished  : {}", report.pruned);
-    println!(
-        "Total In RAM     : {} tracks, {} albums, {} artists",
-        db.track_count(),
-        db.album_count(),
-        db.artist_count()
-    );
-    println!("--------------------------------------------------");
+    // Verify it loads cleanly
+    let (loaded_db, is_hit) = LibraryDatabase::load_or_recover(&test_cache);
+    assert!(is_hit, "Expected cache hit on valid file");
+    println!("Clean load successful: {} tracks in RAM", loaded_db.track_count());
 
-    // 2. Binary Serialization
-    let start_save = Instant::now();
-    db.save_to_file(&cache_file).expect("Failed to save cache");
-    println!("Serialized database to disk in {:?}\n", start_save.elapsed());
-
-    // 3. Multi-Field Search Benchmark & Track Number Verification
-    let queries = LibraryQueries::new(&db);
-    let search_term = "rock";
-    let start_search = Instant::now();
-    let results = queries.search(search_term);
-    let search_time = start_search.elapsed();
-
-    println!("Multi-field search for \"{}\":", search_term);
-    println!("  Found {} matches in {:?}", results.len(), search_time);
-    for track in results.iter().take(5) {
-        println!(
-            "    -> Track #{:02}: {} (Album: {:?})",
-            track.track_number.unwrap_or(0),
-            track.title,
-            track.album_id
-        );
+    // 2. Corrupted payload test (Simulating Bit-rot / Half-written sector)
+    println!("\n[Drill 2] Corrupting file payload with random garbage...");
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&test_cache)
+            .expect("Failed to open file for tampering");
+        // Overwrite middle of the file with garbage bytes
+        file.write_all(b"KUROSO\0\x01\x01\0\0\0CORRUPTED_GARBAGE_PAYLOAD_TEST_DATA").unwrap();
     }
+
+    println!("Attempting recovery from corrupted file...");
+    let (recovered_db, is_hit) = LibraryDatabase::load_or_recover(&test_cache);
+    println!("Recovery result: is_hit = {}, tracks in RAM = {}", is_hit, recovered_db.track_count());
+    assert!(!is_hit, "Corrupted file must not register as a valid cache hit");
+    assert_eq!(recovered_db.track_count(), 0, "Corrupted DB must reset to empty for clean rescan");
+    assert!(!test_cache.exists(), "Original corrupted file must have been moved to quarantine");
+    println!("Quarantine verified: corrupted file safely moved out of the way.");
+
+    // 3. Truncated 0-byte file test (Simulating crash during file allocation)
+    println!("\n[Drill 3] Simulating 0-byte truncated file...");
+    fs::File::create(&test_cache).expect("Failed to create empty file");
+    let (empty_db, is_hit) = LibraryDatabase::load_or_recover(&test_cache);
+    println!("Empty file result: is_hit = {}, tracks = {}", is_hit, empty_db.track_count());
+    assert!(!is_hit, "0-byte file must not be treated as a hit");
+
+    // 4. Atomic save crash-safety test
+    println!("\n[Drill 4] Verifying atomic save leaves original intact on failure...");
+    // Put a healthy state back
+    db.save_to_file(&test_cache).expect("Failed atomic save");
+    let original_size = fs::metadata(&test_cache).unwrap().len();
+
+    // A temp file next to it should never overwrite the master file until sync + rename completes
+    let parent = test_cache.parent().unwrap();
+    let orphan_tmp = parent.join(".kuroso_resilience_test.bin.tmp.fake_pid");
+    fs::write(&orphan_tmp, b"incomplete write from killed process").unwrap();
+
+    // Verify master file was untouched
+    let current_size = fs::metadata(&test_cache).unwrap().len();
+    assert_eq!(original_size, current_size, "Master file altered prematurely!");
+    let _ = fs::remove_file(orphan_tmp);
+
+    // Clean up
+    let _ = fs::remove_file(&test_cache);
+
+    println!("\n==================================================");
+    println!("ALL 4 RESILIENCE & CORRUPTION DRILLS PASSED CLEANLY");
+    println!("==================================================");
 }

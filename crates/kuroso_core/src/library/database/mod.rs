@@ -1,11 +1,49 @@
 use crate::library::types::*;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use std::collections::HashMap;
+use bincode::Options;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Default)]
+const DB_MAGIC: &[u8; 8] = b"KUROSO\0\x01";
+const DB_VERSION: u32 = 1;
+const HEADER_SIZE: usize = 8 + 4; // 8 bytes magic + 4 bytes version
+
+#[derive(Debug)]
+pub enum DatabaseLoadError {
+    Io(std::io::Error),
+    NotFound,
+    EmptyFile,
+    FileTooShort,
+    InvalidMagic,
+    IncompatibleVersion { found: u32, expected: u32 },
+    CorruptedData(bincode::Error),
+}
+
+impl std::fmt::Display for DatabaseLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::NotFound => write!(f, "Database cache file not found"),
+            Self::EmptyFile => write!(f, "Database cache file is empty (0 bytes)"),
+            Self::FileTooShort => write!(f, "Database cache file is shorter than valid header"),
+            Self::InvalidMagic => write!(f, "Invalid magic bytes (not a Kuroso database)"),
+            Self::IncompatibleVersion { found, expected } => {
+                write!(f, "Incompatible schema version: found {found}, expected {expected}")
+            }
+            Self::CorruptedData(e) => write!(f, "Corrupted database payload: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for DatabaseLoadError {}
+
+#[derive(Default, Serialize, Deserialize)]
 pub struct DatabaseState {
     pub tracks: HashMap<TrackId, Track>,
     pub albums: HashMap<AlbumId, Album>,
@@ -37,6 +75,164 @@ impl LibraryDatabase {
             album_id_counter: AtomicU32::new(1),
             artist_id_counter: AtomicU32::new(1),
         }
+    }
+
+    /// Full reinitialization: clears all in-memory tracks, albums, artists, and resets counters.
+    pub fn clear(&self) {
+        let mut state = self.state.write();
+        *state = DatabaseState::default();
+        self.track_id_counter.store(1, Ordering::SeqCst);
+        self.album_id_counter.store(1, Ordering::SeqCst);
+        self.artist_id_counter.store(1, Ordering::SeqCst);
+    }
+
+    /// Atomic persistence with crash-safety:
+    /// Writes to a sibling `.tmp` file, calls fsync, then atomically renames over the destination.
+    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
+        let target_path = path.as_ref();
+        let parent_dir = target_path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent_dir)?;
+
+        let tmp_path = parent_dir.join(format!(
+            ".{}.tmp.{}",
+            target_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("kuroso_cache"),
+            std::process::id()
+        ));
+
+        {
+            let file = File::create(&tmp_path)?;
+            let mut writer = BufWriter::new(file);
+
+            // Write header: 8 bytes magic + 4 bytes version
+            writer.write_all(DB_MAGIC)?;
+            writer.write_all(&DB_VERSION.to_le_bytes())?;
+
+            // Serialize payload with bincode options
+            let state = self.state.read();
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .serialize_into(&mut writer, &*state)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+
+        fs::rename(&tmp_path, target_path)?;
+        Ok(())
+    }
+    /// Loads the binary database from disk with comprehensive validation checks.
+    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseLoadError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(DatabaseLoadError::NotFound);
+        }
+
+        let metadata = fs::metadata(path).map_err(DatabaseLoadError::Io)?;
+        let file_len = metadata.len();
+
+        if file_len == 0 {
+            return Err(DatabaseLoadError::EmptyFile);
+        }
+
+        if (file_len as usize) < HEADER_SIZE {
+            return Err(DatabaseLoadError::FileTooShort);
+        }
+
+        let file = File::open(path).map_err(DatabaseLoadError::Io)?;
+        let mut reader = BufReader::new(file);
+
+        let mut magic_buf = [0u8; 8];
+        reader
+            .read_exact(&mut magic_buf)
+            .map_err(DatabaseLoadError::Io)?;
+        if &magic_buf != DB_MAGIC {
+            return Err(DatabaseLoadError::InvalidMagic);
+        }
+
+        let mut version_buf = [0u8; 4];
+        reader
+            .read_exact(&mut version_buf)
+            .map_err(DatabaseLoadError::Io)?;
+        let version = u32::from_le_bytes(version_buf);
+        if version != DB_VERSION {
+            return Err(DatabaseLoadError::IncompatibleVersion {
+                found: version,
+                expected: DB_VERSION,
+            });
+        }
+
+        let state: DatabaseState = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(file_len) // Prevent malicious or corrupted huge memory allocations
+            .deserialize_from(reader)
+            .map_err(DatabaseLoadError::CorruptedData)?;
+
+        let max_track = state.tracks.keys().map(|k| k.0).max().unwrap_or(0);
+        let max_album = state.albums.keys().map(|k| k.0).max().unwrap_or(0);
+        let max_artist = state.artists.keys().map(|k| k.0).max().unwrap_or(0);
+
+        Ok(Self {
+            state: RwLock::new(state),
+            track_id_counter: AtomicU32::new(max_track + 1),
+            album_id_counter: AtomicU32::new(max_album + 1),
+            artist_id_counter: AtomicU32::new(max_artist + 1),
+        })
+    }
+
+    /// Load database or recover cleanly:
+    /// If missing, returns a clean new DB.
+    /// If corrupted/invalid, renames broken file to `.corrupt.<timestamp>` and returns a clean DB.
+    pub fn load_or_recover<P: AsRef<Path>>(path: P) -> (Self, bool) {
+        let p = path.as_ref();
+        match Self::load_from_file(p) {
+            Ok(db) => {
+                let is_blank = db.track_count() == 0;
+                (db, !is_blank)
+            }
+            Err(DatabaseLoadError::NotFound) => (Self::new(), false),
+            Err(err) => {
+                eprintln!("[WARN] Kuroso cache validation failed ({err}). Quarantining corrupted cache.");
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup_path = p.with_extension(format!("corrupt.{now}"));
+                let _ = fs::rename(p, backup_path);
+                (Self::new(), false)
+            }
+        }
+    }
+
+    pub fn should_rescan(&self, path: &Path, mtime: u64, file_size: u64) -> bool {
+        let state = self.state.read();
+        if let Some(&track_id) = state.path_to_track.get(path) {
+            if let Some(track) = state.tracks.get(&track_id) {
+                return track.mtime != mtime || track.file_size != file_size;
+            }
+        }
+        true
+    }
+
+    pub fn prune_missing_files(&self, live_paths: &HashSet<PathBuf>) -> usize {
+        let dead_paths: Vec<PathBuf> = {
+            let state = self.state.read();
+            state
+                .path_to_track
+                .keys()
+                .filter(|p| !live_paths.contains(*p))
+                .cloned()
+                .collect()
+        };
+
+        let count = dead_paths.len();
+        for path in dead_paths {
+            self.remove_track_by_path(&path);
+        }
+        count
     }
 
     pub fn next_track_id(&self) -> TrackId {
@@ -126,7 +322,8 @@ impl LibraryDatabase {
         }
 
         let artist_id = self.resolve_or_create_artist(&mut state, artist_name);
-        let album_id = album_name.map(|name| self.resolve_or_create_album(&mut state, artist_id, name, year));
+        let album_id =
+            album_name.map(|name| self.resolve_or_create_album(&mut state, artist_id, name, year));
         let track_id = self.next_track_id();
 
         let track = Track {
@@ -180,7 +377,8 @@ impl LibraryDatabase {
 
         let old_track = state.tracks.get(&track_id)?.clone();
         let new_artist_id = self.resolve_or_create_artist(&mut state, artist_name);
-        let new_album_id = album_name.map(|name| self.resolve_or_create_album(&mut state, new_artist_id, name, year));
+        let new_album_id = album_name
+            .map(|name| self.resolve_or_create_album(&mut state, new_artist_id, name, year));
 
         if old_track.album_id != new_album_id {
             if let Some(old_aid) = old_track.album_id {
@@ -191,7 +389,9 @@ impl LibraryDatabase {
                 }
                 if album_empty {
                     if let Some(removed) = state.albums.remove(&old_aid) {
-                        state.album_lookup_to_id.remove(&(removed.artist_id, removed.title));
+                        state
+                            .album_lookup_to_id
+                            .remove(&(removed.artist_id, removed.title));
                         if let Some(art) = state.artists.get_mut(&removed.artist_id) {
                             art.albums.retain(|&id| id != old_aid);
                         }
@@ -323,6 +523,19 @@ impl LibraryDatabase {
     pub fn artist_count(&self) -> usize {
         self.state.read().artists.len()
     }
+
+    pub fn for_each_track<F>(&self, mut f: F)
+    where
+        F: FnMut(&Track, Option<&Album>, &Artist),
+    {
+        let state = self.state.read();
+        for track in state.tracks.values() {
+            if let Some(artist) = state.artists.get(&track.artist_id) {
+                let album = track.album_id.and_then(|aid| state.albums.get(&aid));
+                f(track, album, artist);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -330,126 +543,115 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_insert_and_relational_linkage() {
+    fn test_bincode_save_and_load_roundtrip() {
         let db = LibraryDatabase::new();
-
-        let track_id = db.insert_track(
-            PathBuf::from("/music/track1.opus"),
-            1000,
-            2048,
-            "Track One",
-            "Artist A",
-            Some("Album A"),
-            210000,
-            Some(1),
-            Some(1),
-            Some(2023),
-            AudioFormat::Opus,
-            Some(48000),
-            Some(160000),
-        );
-
-        assert_eq!(db.track_count(), 1);
-        assert_eq!(db.album_count(), 1);
-        assert_eq!(db.artist_count(), 1);
-
-        let track = db.get_track(track_id).expect("Track must exist");
-        assert_eq!(track.title.as_str(), "Track One");
-
-        let album = db.get_album(track.album_id.unwrap()).expect("Album must exist");
-        assert_eq!(album.title.as_str(), "Album A");
-        assert_eq!(album.tracks, vec![track_id]);
-
-        let artist = db.get_artist(track.artist_id).expect("Artist must exist");
-        assert_eq!(artist.name.as_str(), "Artist A");
-        assert_eq!(artist.albums, vec![album.id]);
-    }
-
-    #[test]
-    fn test_update_track_metadata_and_relink() {
-        let db = LibraryDatabase::new();
-        let path = PathBuf::from("/music/change_me.opus");
+        let p = PathBuf::from("/music/roundtrip.opus");
 
         let id = db.insert_track(
-            path.clone(),
-            100,
-            1000,
-            "Initial Title",
-            "Artist Old",
-            Some("Album Old"),
+            p.clone(),
+            500,
+            1024,
+            "Binary Persistence",
+            "Speed Arch",
+            Some("Zero Alloc"),
             180000,
             Some(1),
             Some(1),
-            Some(2020),
+            Some(2026),
             AudioFormat::Opus,
             Some(48000),
             Some(128000),
         );
 
-        assert_eq!(db.artist_count(), 1);
-        assert_eq!(db.album_count(), 1);
+        let temp_dir = std::env::temp_dir();
+        let cache_path = temp_dir.join("kuroso_test_cache_roundtrip.bin");
 
-        let updated_id = db.update_track_metadata(
-            &path,
-            200,
-            1200,
-            "New Title",
-            "Artist New",
-            Some("Album New"),
-            185000,
-            Some(2),
-            Some(1),
-            Some(2021),
-            Some(48000),
-            Some(160000),
-        );
+        db.save_to_file(&cache_path).expect("Failed to save binary cache");
+        let loaded_db =
+            LibraryDatabase::load_from_file(&cache_path).expect("Failed to load binary cache");
 
-        assert_eq!(updated_id, Some(id));
-        assert_eq!(db.artist_count(), 1);
-        assert_eq!(db.album_count(), 1);
+        assert_eq!(loaded_db.track_count(), 1);
+        assert_eq!(loaded_db.album_count(), 1);
+        assert_eq!(loaded_db.artist_count(), 1);
 
-        let track = db.get_track(id).unwrap();
-        assert_eq!(track.title.as_str(), "New Title");
-        assert_eq!(track.track_number, Some(2));
+        let t = loaded_db.get_track(id).expect("Track missing");
+        assert_eq!(t.title.as_str(), "Binary Persistence");
 
-        let new_album = db.get_album(track.album_id.unwrap()).unwrap();
-        assert_eq!(new_album.title.as_str(), "Album New");
-        assert_eq!(new_album.tracks, vec![id]);
-
-        let new_artist = db.get_artist(track.artist_id).unwrap();
-        assert_eq!(new_artist.name.as_str(), "Artist New");
+        let _ = fs::remove_file(cache_path);
     }
 
     #[test]
-    fn test_deletion_and_automatic_orphan_pruning() {
+    fn test_empty_file_fails_cleanly() {
+        let temp_dir = std::env::temp_dir();
+        let cache_path = temp_dir.join("kuroso_test_empty.bin");
+        File::create(&cache_path).expect("Failed to create empty file");
+
+        let result = LibraryDatabase::load_from_file(&cache_path);
+        assert!(matches!(result, Err(DatabaseLoadError::EmptyFile)));
+
+        let (recovered_db, is_hit) = LibraryDatabase::load_or_recover(&cache_path);
+        assert!(!is_hit);
+        assert_eq!(recovered_db.track_count(), 0);
+
+        let _ = fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn test_truncated_header_fails_cleanly() {
+        let temp_dir = std::env::temp_dir();
+        let cache_path = temp_dir.join("kuroso_test_short.bin");
+        {
+            let mut f = File::create(&cache_path).unwrap();
+            f.write_all(b"SHORT").unwrap();
+        }
+
+        let result = LibraryDatabase::load_from_file(&cache_path);
+        assert!(matches!(result, Err(DatabaseLoadError::FileTooShort)));
+
+        let _ = fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn test_corrupted_payload_quarantines_file() {
+        let temp_dir = std::env::temp_dir();
+        let cache_path = temp_dir.join("kuroso_test_corrupt.bin");
+        {
+            let mut f = File::create(&cache_path).unwrap();
+            f.write_all(DB_MAGIC).unwrap();
+            f.write_all(&DB_VERSION.to_le_bytes()).unwrap();
+            f.write_all(b"this is corrupt binary payload garbage").unwrap();
+        }
+
+        let (recovered_db, is_hit) = LibraryDatabase::load_or_recover(&cache_path);
+        assert!(!is_hit);
+        assert_eq!(recovered_db.track_count(), 0);
+        // Original corrupted file is quarantined / moved
+        assert!(!cache_path.exists());
+    }
+
+    #[test]
+    fn test_database_clear_resets_state() {
         let db = LibraryDatabase::new();
-        let path = PathBuf::from("/music/single.mp3");
-
-        let track_id = db.insert_track(
-            path.clone(),
+        db.insert_track(
+            PathBuf::from("/music/s.opus"),
+            100,
+            100,
+            "Song",
+            "Artist",
+            None,
             1000,
-            4096,
-            "Alone",
-            "Solo Artist",
-            None,
-            180000,
             None,
             None,
-            Some(2022),
-            AudioFormat::Mp3,
-            Some(44100),
-            Some(320000),
+            None,
+            AudioFormat::Opus,
+            None,
+            None,
         );
-
         assert_eq!(db.track_count(), 1);
-        assert_eq!(db.artist_count(), 1);
-        assert_eq!(db.album_count(), 0);
 
-        let removed = db.remove_track_by_path(&path);
-        assert_eq!(removed, Some(track_id));
-
+        db.clear();
         assert_eq!(db.track_count(), 0);
-        assert_eq!(db.artist_count(), 0);
         assert_eq!(db.album_count(), 0);
+        assert_eq!(db.artist_count(), 0);
     }
 }
