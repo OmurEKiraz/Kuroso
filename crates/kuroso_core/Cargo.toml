@@ -14,3 +14,11 @@ jwalk.workspace = true
 rayon.workspace = true
 notify-debouncer-mini.workspace = true
 crossbeam-channel.workspace = true
+rand.workspace = true
+
+# Audio
+symphonia.workspace = true
+audiopus.workspace = true
+cpal.workspace = true
+rubato.workspace = true
+ringbuf.workspace = true

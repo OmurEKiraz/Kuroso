@@ -21,3 +21,11 @@ jwalk = "0.8"
 rayon = "1.10"
 notify-debouncer-mini = "0.4"
 crossbeam-channel = "0.5"
+rand = "0.8"
+
+# Audio Engine Dependencies
+symphonia = { version = "0.5", features = ["all"] }
+audiopus = "0.2.0"
+cpal = "0.15"
+rubato = "0.16"
+ringbuf = "0.4"
