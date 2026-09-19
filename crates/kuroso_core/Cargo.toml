@@ -7,10 +7,10 @@ edition.workspace = true
 smol_str.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 bincode.workspace = true
 lofty.workspace = true
 jwalk.workspace = true
 rayon.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
+notify-debouncer-mini.workspace = true
+crossbeam-channel.workspace = true

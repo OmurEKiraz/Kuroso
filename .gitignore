@@ -1,3 +1,36 @@
-
-crates/testacdc/
+# Rust build artifacts
 target/
+**/*.rs.bk
+
+# Cargo lockfile changes for binary distribution (keep if tracking workspace lock)
+# Cargo.lock
+
+# Test audio libraries & mock assets
+crates/testacdc/
+*.opus
+*.flac
+*.mp3
+*.ogg
+*.wav
+*.m4a
+*.aac
+
+# Kuroso binary databases, temp writes, and quarantine dumps
+*.bin
+*.tmp.*
+*.corrupt.*
+
+# Cache & Local runtime state
+.cache/
+artwork_cache/
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
